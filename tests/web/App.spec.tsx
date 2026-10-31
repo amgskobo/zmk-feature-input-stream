@@ -1,7 +1,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { setupZMKMocks } from "@cormoran/zmk-studio-react-hook/testing";
-import App from "../src/App";
+import App from "../../web/src/App";
 
 jest.mock("@zmkfirmware/zmk-studio-ts-client", () => ({
   create_rpc_connection: jest.fn(),
@@ -22,7 +22,7 @@ describe("App Component", () => {
       render(<App />);
       // Status bar shows the title
       expect(
-        screen.getByText(/ZMK Input Stream/i, { selector: ".app-title" })
+        screen.getByText(/ZMK Input Stream/i, { selector: ".app-title" }),
       ).toBeInTheDocument();
       // Both connection buttons present
       expect(screen.getByText(/^Serial$/i)).toBeInTheDocument();
@@ -56,16 +56,16 @@ describe("App Component", () => {
         () => {
           const found = screen.getAllByText(
             (_, el) =>
-              el?.textContent?.toLowerCase().includes("test keyboard") ?? false
+              el?.textContent?.toLowerCase().includes("test keyboard") ?? false,
           );
           expect(found.length).toBeGreaterThan(0);
         },
-        { timeout: 3000 }
+        { timeout: 3000 },
       );
 
       // Stream button and disconnect in status bar
       expect(
-        screen.getByText(/Enable Stream/i, { selector: "button" })
+        screen.getByText(/Enable Stream/i, { selector: "button" }),
       ).toBeInTheDocument();
       expect(screen.getByTitle(/Disconnect/i)).toBeInTheDocument();
     });
