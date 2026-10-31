@@ -20,3 +20,11 @@ config ZMK_INPUT_STREAM_NOTIF_QUEUE_SIZE
 endif # ZMK_INPUT_STREAM_FEATURE_STUDIO_RPC
 
 endif # ZMK_INPUT_STREAM_FEATURE
+
+config ZMK_INPUT_STREAM_FORK_LOG_LEVEL
+    int "zmk-input-stream-fork log level (0 off, 1 error, 2 warning, 3 info, 4 debug)"
+    range 0 4
+    default 3
+    help
+      Logs contain operational state and numeric diagnostics, never input
+      contents, user labels, peer addresses or authentication material.

@@ -1,20 +1,31 @@
 #include <pb_decode.h>
 #include <pb_encode.h>
 #include <string.h>
+#include <stdio.h>
 #include <zmk/studio/custom.h>
 #include <zmk/input_stream/input_stream.pb.h>
 #include <zmk/workqueue.h>
+#include <zmk/studio/core.h>
 
 #include <zmk/events/position_state_changed.h>
 #include <zmk/events/layer_state_changed.h>
+#include <zmk/events/endpoint_changed.h>
 #include <zmk/keymap.h>
 #include <zmk/behavior.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+#ifndef CONFIG_ZMK_INPUT_STREAM_FORK_LOG_LEVEL
+#define CONFIG_ZMK_INPUT_STREAM_FORK_LOG_LEVEL 3
+#endif
+LOG_MODULE_REGISTER(zmk_input_stream_fork_input_stream_handler,
+                    CONFIG_ZMK_INPUT_STREAM_FORK_LOG_LEVEL);
 
-static atomic_t streaming_enabled = ATOMIC_INIT(0);
+/* This lock protects lifecycle and queue operations, never transport I/O. */
+static struct k_spinlock notif_lock;
+static bool streaming_enabled;
+static uint32_t stream_epoch;
+static uint32_t notifications_queued, notifications_dropped;
 
 static struct zmk_rpc_custom_subsystem_meta input_stream_meta = {
     ZMK_RPC_CUSTOM_SUBSYSTEM_UI_URLS("https://cormoran.github.io/zmk-feature-input-stream/"),
@@ -26,13 +37,21 @@ ZMK_RPC_CUSTOM_SUBSYSTEM(zmk__input_stream, &input_stream_meta, input_stream_rpc
 ZMK_RPC_CUSTOM_SUBSYSTEM_RESPONSE_BUFFER(zmk__input_stream, zmk_input_stream_Response);
 
 static int get_own_subsystem_index(void) {
+    /* The linker registry is fixed for this boot. Only the serialized sender
+     * work calls here, so a successful lookup needs neither another scan nor
+     * a lifecycle lock. Failed lookups remain retryable. */
+    static int cached_index = -1;
+    if (cached_index >= 0) {
+        return cached_index;
+    }
     size_t count;
     STRUCT_SECTION_COUNT(zmk_rpc_custom_subsystem, &count);
     for (size_t i = 0; i < count; i++) {
         struct zmk_rpc_custom_subsystem *s;
         STRUCT_SECTION_GET(zmk_rpc_custom_subsystem, i, &s);
         if (strcmp(s->identifier, "zmk__input_stream") == 0) {
-            return (int)i;
+            cached_index = (int)i;
+            return cached_index;
         }
     }
     return -1;
@@ -40,22 +59,53 @@ static int get_own_subsystem_index(void) {
 
 /* ── Direct notification send (called only from the low-priority work handler) ── */
 
-static zmk_input_stream_Notification s_notification;
+struct queued_notification {
+    zmk_input_stream_Notification payload;
+    uint32_t epoch;
+};
+
+struct notification_encoding {
+    struct queued_notification item;
+    bool decided;
+    bool allowed;
+};
+static struct notification_encoding s_notification;
+
+static bool stream_epoch_is_current(uint32_t epoch) {
+    k_spinlock_key_t key = k_spin_lock(&notif_lock);
+    bool current = streaming_enabled && epoch == stream_epoch &&
+                   zmk_studio_core_get_lock_state() == ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED;
+    k_spin_unlock(&notif_lock, key);
+    return current;
+}
 
 static bool encode_notification_payload(pb_ostream_t *stream, const pb_field_t *field,
                                         void *const *arg) {
-    const zmk_input_stream_Notification *notif = (const zmk_input_stream_Notification *)*arg;
+    struct notification_encoding *notif = *arg;
+    /* The first encoder pass starts after the transport mutex wait. Nanopb
+     * sizes nested messages before writing them: keep one decision for all
+     * passes so revocation cannot leave an unterminated Studio frame. */
+    if (!notif->decided) {
+        notif->allowed = stream_epoch_is_current(notif->item.epoch);
+        notif->decided = true;
+    }
+    if (!notif->allowed) {
+        return true; /* omit the bytes field; the enclosing frame stays valid */
+    }
     return zmk_rpc_custom_subsystem_encode_response_payload(
-        stream, field, zmk_input_stream_Notification_fields, notif);
+        stream, field, zmk_input_stream_Notification_fields, &notif->item.payload);
 }
 
-static void send_notification_direct(const zmk_input_stream_Notification *notif) {
+static void send_notification_direct(const struct queued_notification *notif) {
+    if (!stream_epoch_is_current(notif->epoch)) {
+        return;
+    }
     int idx = get_own_subsystem_index();
     if (idx < 0) {
         LOG_ERR("input_stream subsystem not found");
         return;
     }
-    s_notification = *notif;
+    s_notification = (struct notification_encoding){.item = *notif};
     struct zmk_studio_custom_notification custom_notif = {
         .subsystem_index = (uint8_t)idx,
         .encode_payload =
@@ -70,20 +120,64 @@ static void send_notification_direct(const zmk_input_stream_Notification *notif)
 /* ── Notification queue + low-priority sender ──────────────────────────── */
 
 /* Fixed-capacity message queue. Alignment 4 matches ZMK's behavior_queue.c pattern. */
-K_MSGQ_DEFINE(notif_queue, sizeof(zmk_input_stream_Notification),
+K_MSGQ_DEFINE(notif_queue, sizeof(struct queued_notification),
               CONFIG_ZMK_INPUT_STREAM_NOTIF_QUEUE_SIZE, 4);
-
-/* Tracks items currently in the queue (incremented on put, decremented on get). */
-static atomic_t notif_pending = ATOMIC_INIT(0);
 
 static void notif_send_work_handler(struct k_work *work);
 static K_WORK_DEFINE(notif_send_work, notif_send_work_handler);
 
+static bool capture_stream_epoch(uint32_t *epoch) {
+    k_spinlock_key_t key = k_spin_lock(&notif_lock);
+    bool enabled = streaming_enabled &&
+                   zmk_studio_core_get_lock_state() == ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED;
+    *epoch = stream_epoch;
+    k_spin_unlock(&notif_lock, key);
+    return enabled;
+}
+
+static bool set_stream_enabled(bool enabled) {
+    k_spinlock_key_t key = k_spin_lock(&notif_lock);
+    if (enabled && zmk_studio_core_get_lock_state() != ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED) {
+        k_spin_unlock(&notif_lock, key);
+        return false;
+    }
+    const bool changed = streaming_enabled != enabled;
+    if (changed) {
+        stream_epoch++;
+        streaming_enabled = enabled;
+        k_msgq_purge(&notif_queue);
+    }
+    const uint32_t epoch = stream_epoch;
+    const uint32_t queued = notifications_queued;
+    const uint32_t dropped = notifications_dropped;
+    k_spin_unlock(&notif_lock, key);
+    if (changed) {
+        LOG_INF("stream enabled=%d epoch=%u queued=%u dropped=%u", enabled, epoch, queued, dropped);
+    }
+    return true;
+}
+
 static void notif_send_work_handler(struct k_work *work) {
-    zmk_input_stream_Notification notif;
-    while (k_msgq_get(&notif_queue, &notif, K_NO_WAIT) == 0) {
-        atomic_dec(&notif_pending);
-        send_notification_direct(&notif);
+    ARG_UNUSED(work);
+    struct queued_notification item;
+    k_spinlock_key_t key = k_spin_lock(&notif_lock);
+    bool send = streaming_enabled && k_msgq_get(&notif_queue, &item, K_NO_WAIT) == 0;
+    if (send) {
+        send = item.epoch == stream_epoch;
+    }
+    k_spin_unlock(&notif_lock, key);
+
+    /* One dispatch per invocation gives already queued work a turn. A selected
+     * dispatch can still block or finish after a disable request. */
+    if (send) {
+        send_notification_direct(&item);
+    }
+
+    key = k_spin_lock(&notif_lock);
+    bool more = streaming_enabled && k_msgq_num_used_get(&notif_queue) > 0;
+    k_spin_unlock(&notif_lock, key);
+    if (more) {
+        k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &notif_send_work);
     }
 }
 
@@ -92,13 +186,18 @@ static void notif_send_work_handler(struct k_work *work) {
  * Called from event handlers; returns immediately so the event thread is not stalled.
  * Drops silently if the queue is full (limit = CONFIG_ZMK_INPUT_STREAM_NOTIF_QUEUE_SIZE).
  */
-static void enqueue_notification(const zmk_input_stream_Notification *notif) {
-    if (atomic_get(&notif_pending) >= CONFIG_ZMK_INPUT_STREAM_NOTIF_QUEUE_SIZE) {
-        LOG_DBG("Notification queue full, dropping");
-        return;
+static void enqueue_notification(const zmk_input_stream_Notification *notif, uint32_t epoch) {
+    struct queued_notification item = {.payload = *notif, .epoch = epoch};
+    k_spinlock_key_t key = k_spin_lock(&notif_lock);
+    bool queued = streaming_enabled && epoch == stream_epoch &&
+                  k_msgq_put(&notif_queue, &item, K_NO_WAIT) == 0;
+    if (queued) {
+        notifications_queued++;
+    } else if (streaming_enabled && epoch == stream_epoch) {
+        notifications_dropped++;
     }
-    if (k_msgq_put(&notif_queue, notif, K_NO_WAIT) == 0) {
-        atomic_inc(&notif_pending);
+    k_spin_unlock(&notif_lock, key);
+    if (queued) {
         k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &notif_send_work);
     }
 }
@@ -124,13 +223,16 @@ static bool input_stream_rpc_handle_request(const zmk_custom_CallRequest *raw_re
 
     switch (req.which_request_type) {
     case zmk_input_stream_Request_enable_stream_tag:
-        LOG_DBG("Enabling input stream");
-        atomic_set(&streaming_enabled, 1);
+        if (!set_stream_enabled(true)) {
+            resp->which_response_type = zmk_input_stream_Response_error_tag;
+            snprintf(resp->response_type.error.message, sizeof(resp->response_type.error.message),
+                     "Unlock required");
+            break;
+        }
         resp->which_response_type = zmk_input_stream_Response_ok_tag;
         break;
     case zmk_input_stream_Request_disable_stream_tag:
-        LOG_DBG("Disabling input stream");
-        atomic_set(&streaming_enabled, 0);
+        set_stream_enabled(false);
         resp->which_response_type = zmk_input_stream_Response_ok_tag;
         break;
     default:
@@ -147,7 +249,8 @@ static bool input_stream_rpc_handle_request(const zmk_custom_CallRequest *raw_re
 }
 
 static int on_position_state_changed(const zmk_event_t *eh) {
-    if (!atomic_get(&streaming_enabled)) {
+    uint32_t epoch;
+    if (!capture_stream_epoch(&epoch)) {
         return ZMK_EV_EVENT_BUBBLE;
     }
     const struct zmk_position_state_changed *ev = as_zmk_position_state_changed(eh);
@@ -173,7 +276,7 @@ static int on_position_state_changed(const zmk_event_t *eh) {
         notif.notification_type.key_event.param2 = binding->param2;
     }
 
-    enqueue_notification(&notif);
+    enqueue_notification(&notif, epoch);
     return ZMK_EV_EVENT_BUBBLE;
 }
 
@@ -181,7 +284,8 @@ ZMK_LISTENER(input_stream_position, on_position_state_changed);
 ZMK_SUBSCRIPTION(input_stream_position, zmk_position_state_changed);
 
 static int on_layer_state_changed(const zmk_event_t *eh) {
-    if (!atomic_get(&streaming_enabled)) {
+    uint32_t epoch;
+    if (!capture_stream_epoch(&epoch)) {
         return ZMK_EV_EVENT_BUBBLE;
     }
 
@@ -189,9 +293,26 @@ static int on_layer_state_changed(const zmk_event_t *eh) {
     notif.which_notification_type = zmk_input_stream_Notification_layer_change_tag;
     notif.notification_type.layer_change.layer_index = zmk_keymap_highest_layer_active();
 
-    enqueue_notification(&notif);
+    enqueue_notification(&notif, epoch);
     return ZMK_EV_EVENT_BUBBLE;
 }
 
 ZMK_LISTENER(input_stream_layer, on_layer_state_changed);
 ZMK_SUBSCRIPTION(input_stream_layer, zmk_layer_state_changed);
+
+/* Secured RPC registration gates requests, not asynchronous notifications.
+ * Revoke the local stream on a lock or output change without waiting for work
+ * or transport I/O. Unlocking alone never restores a previous stream. */
+static int on_stream_authorization_changed(const zmk_event_t *eh) {
+    const struct zmk_studio_core_lock_state_changed *lock =
+        as_zmk_studio_core_lock_state_changed(eh);
+    if (as_zmk_endpoint_changed(eh) ||
+        (lock && lock->state != ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED)) {
+        set_stream_enabled(false);
+    }
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(input_stream_authorization, on_stream_authorization_changed);
+ZMK_SUBSCRIPTION(input_stream_authorization, zmk_studio_core_lock_state_changed);
+ZMK_SUBSCRIPTION(input_stream_authorization, zmk_endpoint_changed);

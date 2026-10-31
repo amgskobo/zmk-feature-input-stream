@@ -1,0 +1,9 @@
+/ {
+    chosen { zmk,kscan = &test_kscan; };
+    test_kscan: kscan {
+        compatible = "zmk,kscan-mock";
+        status = "disabled";
+        rows = <1>;
+        columns = <16>;
+    };
+};

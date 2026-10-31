@@ -1,15 +1,26 @@
 import platform
-import shutil
+import os
+import tempfile
 import subprocess
 import unittest
 from pathlib import Path
 
 from dataclasses import dataclass
 
-THIS_DIR = Path(__file__).parent.resolve()
+from native_verifier import verify_native
+from test_native_verifier import NativeVerifierContract as NativeVerifierContract
+
+from test_build_budget import BuildBudgetContract as BuildBudgetContract
+
+THIS_DIR = Path(__file__).resolve().parent.parent
 
 
 def run_west(args: list[str]) -> subprocess.CompletedProcess[str]:
+    if args and args[0] == "zmk-build":
+        parallelism = int(os.environ.get("OWNER_TEST_BUILD_PARALLELISM", "1"))
+        if parallelism < 1:
+            raise ValueError("OWNER_TEST_BUILD_PARALLELISM must be a positive integer")
+        args = [args[0], "--parallelism", str(parallelism), *args[1:]]
     return subprocess.run(
         ["west", *args],
         capture_output=True,
@@ -38,17 +49,23 @@ class WestCommandsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.WEST_TOPDIR = Path(run_west(["topdir"]).stdout.strip())
-        cls.BUILD_DIR = cls.WEST_TOPDIR / "build"
+        requested_output = os.environ.get("OWNER_TEST_OUTPUT")
+        if requested_output:
+            cls.BUILD_DIR = Path(requested_output).resolve()
+            cls.BUILD_DIR.mkdir(parents=True, exist_ok=False)
+        else:
+            cls.BUILD_DIR = Path(tempfile.mkdtemp(prefix=THIS_DIR.name + "-tests-"))
+        print(f"Owner test output: {cls.BUILD_DIR}", flush=True)
 
     @unittest.skipUnless(
         platform.system() == "Linux", "zmk-test is only supported on Linux"
     )
     def test_zmk_test(self):
         test_build_dir = self.BUILD_DIR / THIS_DIR.name
-        shutil.rmtree(test_build_dir, ignore_errors=True)
 
         result = run_west(["zmk-test", "tests", "-m", ".", "-d", str(test_build_dir)])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        verify_native(test_build_dir, THIS_DIR / "tests")
         self.assertIn("PASS: test", result.stdout, result.stdout + result.stderr)
         self.assertIn("PASS: studio", result.stdout, result.stdout + result.stderr)
         self.assertNotIn("FAILED: ", result.stdout, result.stdout + result.stderr)
@@ -88,14 +105,45 @@ class WestCommandsTests(unittest.TestCase):
             }
         )
 
+    @unittest.skipUnless(
+        platform.system() == "Linux", "sender kernel boundaries require Linux"
+    )
+    def test_sender_kernel_boundaries(self):
+        result = subprocess.run(
+            ["bash", "tests/sender/run.sh"],
+            env={
+                **os.environ,
+                "INPUT_STREAM_NATIVE_ARTIFACTS": os.environ.get(
+                    "INPUT_STREAM_NATIVE_ARTIFACTS", str(self.BUILD_DIR / "sender")
+                ),
+            },
+            capture_output=True,
+            text=True,
+            cwd=THIS_DIR,
+        )
+        (self.BUILD_DIR / "test_sender_kernel_boundaries.log").write_text(
+            result.stdout + result.stderr, encoding="utf-8"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "Completed input-stream sender scenarios=14 repeats=3", result.stdout
+        )
+
     def _test_zmk_build(
         self, artifacts_and_expected_build_params: dict[str, ConfigAndDeviceTree]
     ):
 
-        for artifact in artifacts_and_expected_build_params.keys():
-            shutil.rmtree(self.BUILD_DIR / artifact, ignore_errors=True)
-
-        result = run_west(["zmk-build", "tests/zmk-config", "-q"])
+        result = run_west(
+            [
+                "zmk-build",
+                "tests/zmk-config",
+                "-q",
+                "-P",
+                "1",
+                "-d",
+                str(self.BUILD_DIR),
+            ]
+        )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
         for artifact, entries in artifacts_and_expected_build_params.items():

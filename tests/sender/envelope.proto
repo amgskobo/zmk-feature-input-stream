@@ -1,0 +1,5 @@
+syntax = "proto3";
+package sender_fixture;
+// Exercise the same sizing/write passes as a nested Studio custom payload.
+message Payload { bytes body = 1; }
+message Envelope { Payload payload = 1; }
