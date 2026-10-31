@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "owner": "zmk-input-stream-fork",
+  "supported_cores": [
+    "dya"
+  ],
+  "unsupported_core_status": "NOT APPLICABLE",
+  "commands": [
+    "python3 -m unittest discover -v -s tests -p test_owner.py",
+    "bash tests/run-web.sh"
+  ],
+  "coverage_map": "tests/README.md",
+  "preserved_assertions": "Relocated fixtures retain their prior assertions; no snapshot auto-accept or unique assertion removal.",
+  "execution": {
+    "quick": "All behavioral scenarios once; sanitizer variants where supported.",
+    "full": "Same scenarios plus relevant optimization, ABI, role, kernel and supported-core checks.",
+    "outputs": "Use a fresh evidence directory; existing evidence is never overwritten."
+  },
+  "gaps": [
+    "Physical USB/BLE/split delivery, timing, power and retention require matching production-board evidence."
+  ],
+  "native_verification": "tests/native_verifier.py: actual exit, registered test completion, raw ordered logs, unchanged snapshots, identical binary repeated three times.",
+  "notification_lookup": {
+    "fixture": "tests/sender/main.c lookup and missing scenarios",
+    "contract": "Successful immutable linker-registry index reused by serialized sender; failed lookups retry. Actual section-visit count is constant after first success. Exact payload/order, restart and authorization fences retained. Original lookup and missing count assertions fail3/3. All14 sender scenarios run3times from one binary.",
+    "physical": "NOT RUN"
+  }
+}

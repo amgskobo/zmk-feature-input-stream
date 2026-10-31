@@ -1,12 +1,20 @@
 # ZMK Input Stream — Live Key Visualizer
 
+## Reviewed fork
+
+This fork's reviewed source is on `codex/input-stream-review` in
+[`amgskobo/zmk-feature-input-stream`](https://github.com/amgskobo/zmk-feature-input-stream/tree/codex/input-stream-review).
+Select that repository URL and revision in the module's west project entry.
+Keep the module's documented imports enabled where required. The original
+upstream installation examples below describe the upstream repository.
+
 ![ZMK Version](https://img.shields.io/badge/ZMK-master-blue)
 
 A ZMK module that streams key press/release events and layer changes to a web UI for live visualization.
 
 ## Features
 
-- **Live key streaming**: forwards every physical key press/release over the custom Studio RPC protocol
+- **Live key streaming**: forwards physical key press/release events over the custom Studio RPC protocol with a bounded, best-effort queue
 - **Layer tracking**: notifies the web UI whenever the active layer changes
 - **Web visualizer**: renders the physical key layout, highlights pressed keys, plays a unique beep per key, and marks keys that have been pressed at least once
 - **Behavior & keycode history**: shows a rolling log of firmware behavior events and browser key events
@@ -83,13 +91,55 @@ Connect your keyboard via USB, open the web UI, click **Connect Serial**, unlock
 pre-commit run
 
 # Run firmware unit + build tests
-python3 -m unittest
+python3 -m unittest discover -s tests -p test_owner.py
 
 # Run web tests
 cd web && npm test
 ```
 
-## Known issue
+## Delivery and lifecycle limits
 
-If device is disconnected from web UI before stopping stream, zmk zmk_workqueue_lowprio_work_q becomes in stuck to wait finishing sending streaming data.
-Timeout improvement in zmk is required for improvement.
+The sender dispatches one notification per low-priority work invocation, then
+resubmits at the queue tail. Disable discards queued notifications and rejects
+producers from an earlier enable session; repeated enable is idempotent.
+The sender resolves its fixed linker-registry index once after the first
+successful lookup and reuses it for later notifications, including a later
+enable session. A failed lookup is retried. This caches no authorization or
+payload: the existing epoch and lock checks still run for every dispatch.
+Lifecycle/queue locks are released before entering the Studio transport.
+Studio locking or switching the selected endpoint also disables streaming and
+purges queued data. Unlocking alone does not restart it: enable explicitly on
+the authorized connection. Authorization is checked again before encoding a
+selected payload on its first encoder pass, so waiting for the transport does
+not preserve old access. A revoked payload is omitted from a valid envelope;
+the encoder does not abort a frame that the core has already started.
+The Web client listens to Studio's lock notification, clears held-key highlights
+and rejects a pending enable acknowledgement from before that lock. Unlock does
+not resume a previously revoked stream; click Enable Stream again.
+
+The web client clears held-key highlights after a successful stop and ignores
+notifications while disabled. Replacing the connection clears its view state;
+old callbacks and unfinished RPC responses cannot reactivate the new view.
+Events arriving before a successful enable acknowledgement are accepted, then
+discarded if that enable fails. Disable errors leave the stream active for retry.
+These rules cannot distinguish an old wire packet delivered after re-enable:
+the unchanged protocol has no session identifier.
+
+A selected dispatch may still block after disable, but its payload is rejected
+before its first encoder pass. Nanopb's sizing and output passes share that
+authorization decision, so a notification committed at sizing finishes even if
+locking occurs before output. Later events are stopped. ZMK's synchronous
+RPC sender has no cancellation/deadline API here. A transport stall can therefore
+still hold the low-priority workqueue and RPC transport mutex. The work budget
+does not guarantee progress while that call is blocked.
+
+Queue overflow drops excess notifications. A lost release can leave the client
+visualization pressed until a later matching event or client reset. The current
+schema has no state snapshot, sequence or session identifier, so reconnect and
+loss recovery are not guaranteed. These are Studio visualization notifications,
+not the keyboard's HID key delivery path.
+
+The owner [sender boundary test](tests/sender/README.md) uses real kernel work
+and queues with a controlled send boundary; the normal unittest command includes
+it alongside existing registration and board build fixtures. Actual USB/BLE
+congestion, disconnect and reconnect require production-device verification.
