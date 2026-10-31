@@ -28,14 +28,15 @@ jobs:
       - name: Prepare compiler and checker
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends gcc-multilib
-          python3 -m pip install pre-commit==4.7.0
+          apt-get install -y --no-install-recommends gcc-multilib python3-venv
+          python3 -m venv /tmp/fork-review-checkers
+          /tmp/fork-review-checkers/bin/python -m pip install pre-commit==4.7.0
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: ./.github/actions/west-init
       - name: Check owned tests and tools
         env:
           SKIP: eslint,jest,web-build,zmk-module-test
-        run: git ls-files -z -- tests tools | xargs -0 -r pre-commit run --verbose --files
+        run: git ls-files -z -- tests tools | xargs -0 -r /tmp/fork-review-checkers/bin/python -m pre_commit run --verbose --files
       - name: Complete owner firmware matrix
         run: OWNER_TEST_OUTPUT="$PWD/owner-test-output" python3 -m unittest discover -v -s tests -p test_owner.py
 
