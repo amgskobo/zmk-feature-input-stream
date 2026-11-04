@@ -2,7 +2,7 @@
 
 Run `bash tests/sender/run.sh` in the resolved owner west workspace. The normal
 `python3 -m unittest discover -v -s tests -p test_owner.py` command includes it. One small native_sim binary
-compiles the complete production handler, unchanged module schema, real
+compiles the complete production handler, module schema, real
 nanopb, Zephyr message queue/spinlock/work and ZMK low-priority queue/event
 manager. Only the Studio registry/envelope/transport and keymap lookup are
 controlled boundaries. This does not emulate USB, BLE or the physical board.
@@ -12,7 +12,8 @@ The fixture disables CMake's west module discovery with `WEST=OFF` and an empty
 An empty module list alone lets Zephyr discover the containing workspace and
 load unrelated application Kconfig files into this standalone kernel fixture.
 
-Fourteen scenarios run in fresh processes three times each:
+Seventeen scenarios run in fresh processes three times each; all fourteen
+original scenarios remain:
 
 - `control`: disabled filtering, repeated enable without losing queued data,
   exact key/layer order, binding IDs/uint32 values, null binding, malformed and
@@ -45,6 +46,14 @@ Fourteen scenarios run in fresh processes three times each:
   committed notification with the same payload, then blocks subsequent events.
 - `endpoint`: switching the selected endpoint purges and disables streaming;
   explicit enable is required to resume it.
+- `lease-expiry`: the real timer revokes authorization and purges queued data
+  while the worker queue cannot progress. Late/missing/stale renewal tokens
+  cannot start a new stream after cleanup or renew a replacement stream.
+- `lease-renewal`: an identical current-epoch renewal extends the deadline
+  without changing the epoch, then no further renewal expires normally.
+- `layer-order`: the initial response and layer notifications use current
+  indices for reordered stable IDs, exclude active layers below the default,
+  and report a middle-layer change without changing the highest index.
 
 Semaphore gates use bounded waits; failed checks exit nonzero. Raw dispatch and
 peer timestamps/order are preserved. `INPUT_STREAM_NATIVE_ARTIFACTS` retains
@@ -61,6 +70,6 @@ lengths even when the payload is omitted. A notification already committed at
 the first sizing pass finishes; subsequent events are stopped. The module
 cannot abort ZMK's synchronous RPC transport call. Its one-dispatch
 work budget provides fairness once a call returns, not a bound on send latency.
-This schema has no snapshot/sequence/session field, so complete loss recovery
+Notification packets have no held-key snapshot/sequence/epoch, so complete loss recovery
 or identifying a previous in-flight packet after reconnect needs a separately
 defined protocol/client contract. Physical transport acceptance remains open.

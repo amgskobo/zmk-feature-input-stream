@@ -17,6 +17,16 @@ config ZMK_INPUT_STREAM_NOTIF_QUEUE_SIZE
       Maximum number of key/layer notifications buffered between the event
       handler and the low-priority sender. Excess notifications are dropped.
 
+config ZMK_INPUT_STREAM_LEASE_MS
+    int "Input stream client lease (ms)"
+    default 15000
+    range 10000 120000
+    help
+      Expire a stream unless its owning epoch is renewed within this time.
+      The Web client renews every two seconds. A timer revokes authorization
+      and purges queued reports even while the sender is blocked. Older
+      viewers must implement renewal or their streams expire after one lease.
+
 endif # ZMK_INPUT_STREAM_FEATURE_STUDIO_RPC
 
 endif # ZMK_INPUT_STREAM_FEATURE

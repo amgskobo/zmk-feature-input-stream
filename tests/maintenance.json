@@ -22,7 +22,13 @@
   "native_verification": "tests/native_verifier.py: actual exit, registered test completion, raw ordered logs, unchanged snapshots, identical binary repeated three times.",
   "notification_lookup": {
     "fixture": "tests/sender/main.c lookup and missing scenarios",
-    "contract": "Successful immutable linker-registry index reused by serialized sender; failed lookups retry. Actual section-visit count is constant after first success. Exact payload/order, restart and authorization fences retained. Original lookup and missing count assertions fail3/3. All14 sender scenarios run3times from one binary.",
+    "contract": "Successful immutable linker-registry index reused by serialized sender; failed lookups retry. Actual section-visit count is constant after first success. Exact payload/order, restart and authorization fences retained. Original lookup and missing count assertions fail3/3. All fourteen original sender scenarios and three lease/layer scenarios run three times from one binary.",
     "physical": "NOT RUN"
+  },
+  "review_regressions": {
+    "firmware": "lease-expiry, lease-renewal, layer-order: actual kernel timer/spinlock/queue and RPC codec; valid token renewal, stale token rejection after cleanup/replacement, index-mask/default filtering with reordered IDs.",
+    "web": "tests/web/lease.spec.tsx and bindings.spec.ts: token renewal, disconnect ordering, late reply retirement, complete provisional rollback without losing confirmed state, active-only transparent labels and unknown legacy fallback; existing uint32 lookup bounds retained.",
+    "negative_controls": "tests/review_negative_control.py: four kernel and two Web faults in isolated container source copies; require executable assertion failures, not setup/compile failures.",
+    "limits": "Synthetic keymap/transport boundaries; no physical USB/BLE/HID, power, full held-key loss recovery, or cancellation of a core TX call already committed."
   }
 }

@@ -424,4 +424,283 @@ describe("Stream lifecycle", () => {
       "keycap-pressed",
     );
   });
+
+  it("rejects invalid layer indices with bounded rendering and recovers on valid events", async () => {
+    const data = await mockCallRpc.getMockImplementation()!();
+    let numericReads = 0;
+    data.keymap.getKeymap.layers = new Proxy(data.keymap.getKeymap.layers, {
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^\d+$/.test(property)) {
+          numericReads++;
+          // Count the real production array accesses; stop an unsafe original
+          // loop before it can perform billions of synchronous operations.
+          if (numericReads > 128) throw new Error("layer scan budget exceeded");
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    mockCallRpc.mockResolvedValue(data);
+    const { app } = mount();
+    await started();
+    const cb = callback(app);
+    const layer = (layerIndex: number) => {
+      const payload = Notification.encode(
+        Notification.create({ layerChange: { layerIndex } }),
+      ).finish();
+      expect(Notification.decode(payload).layerChange?.layerIndex).toBe(
+        layerIndex,
+      );
+      act(() => cb({ subsystemIndex: 0, payload }));
+    };
+    layer(1);
+    expect(screen.getByText("Layer 1")).toBeInTheDocument();
+    numericReads = 0;
+    for (const invalid of [0xffffffff, 2]) {
+      expect(() => layer(invalid)).not.toThrow();
+      expect(screen.getByText("Layer 1")).toBeInTheDocument();
+    }
+    expect(numericReads).toBeLessThanOrEqual(128);
+    layer(0);
+    expect(screen.getByText("Layer 0")).toBeInTheDocument();
+    send(cb, true);
+    expect(document.querySelector(".keycap")).toHaveClass("keycap-pressed");
+  });
+
+  it("retains a valid layer arriving synchronously before the enable acknowledgement", async () => {
+    const app = createConnectedMockZMKApp({
+      subsystems: [SUBSYSTEM_IDENTIFIER],
+    });
+    const pending = deferred();
+    callRPCSpy.mockImplementationOnce(() => {
+      callback(app)({
+        subsystemIndex: 0,
+        payload: Notification.encode(
+          Notification.create({ layerChange: { layerIndex: 1 } }),
+        ).finish(),
+      });
+      return pending.promise;
+    });
+    mount(app);
+    await waitFor(() => expect(callRPCSpy).toHaveBeenCalled());
+    expect(screen.getByText("Layer 1")).toBeInTheDocument();
+    await act(async () => pending.resolve(null));
+    await started();
+    expect(screen.getByText("Layer 1")).toBeInTheDocument();
+  });
+  it.each(["success", "error"])(
+    "retires a pending enable %s when only the subsystem index changes",
+    async (outcome) => {
+      let index = 0;
+      const app = createConnectedMockZMKApp({
+        subsystems: [SUBSYSTEM_IDENTIFIER],
+      });
+      app.findSubsystem = jest.fn(() => ({
+        index,
+        identifier: SUBSYSTEM_IDENTIFIER,
+      }));
+      const previous = deferred();
+      const current = deferred();
+      const indices: number[] = [];
+      callRPCSpy.mockImplementation(function (this: ZMKCustomSubsystem) {
+        const target = this.getSubsystemIndex();
+        indices.push(target);
+        return target === 0 ? previous.promise : current.promise;
+      });
+      const view = mount(app);
+      await waitFor(() => expect(indices).toEqual([0]));
+      const oldCallback = callback(app);
+      const sameConnection = app.state.connection;
+      index = 7;
+      view.rerender(
+        <ZMKAppProvider value={app}>
+          <InputStreamSection {...PROPS} />
+        </ZMKAppProvider>,
+      );
+      await waitFor(() => {
+        const calls = (app.onNotification as jest.Mock).mock.calls.filter(
+          ([sub]) => sub.type === "custom",
+        );
+        expect(calls[calls.length - 1][0].subsystemIndex).toBe(7);
+      });
+      await act(async () =>
+        previous.resolve(
+          outcome === "success"
+            ? null
+            : Response.encode(
+                Response.create({
+                  error: { message: "retired index refusal" },
+                }),
+              ).finish(),
+        ),
+      );
+      send(oldCallback, true);
+      expect(document.querySelectorAll(".keycap-pressed")).toHaveLength(0);
+      expect(
+        document.querySelector(".error-bar")?.textContent ?? "",
+      ).not.toContain("retired index refusal");
+      expect(
+        screen.queryByRole("button", { name: "Disable Stream" }),
+      ).not.toBeInTheDocument();
+      expect(app.state.connection).toBe(sameConnection);
+      await waitFor(() => expect(indices).toEqual([0, 7]));
+      await act(async () => current.resolve(null));
+      await started();
+      send(oldCallback, true);
+      expect(document.querySelectorAll(".keycap-pressed")).toHaveLength(0);
+      view.unmount();
+    },
+  );
+  it("accepts the loaded current catalog index and valid layer", async () => {
+    const app = createConnectedMockZMKApp({
+      subsystems: [SUBSYSTEM_IDENTIFIER],
+    });
+    app.findSubsystem = jest.fn(() => ({
+      index: 7,
+      identifier: SUBSYSTEM_IDENTIFIER,
+    }));
+    const indices: number[] = [];
+    callRPCSpy.mockImplementation(function (this: ZMKCustomSubsystem) {
+      indices.push(this.getSubsystemIndex());
+      return Promise.resolve(null);
+    });
+    mount(app);
+    await started();
+    expect(indices).toEqual([7]);
+    act(() =>
+      callback(app)({
+        subsystemIndex: 7,
+        payload: Notification.encode(
+          Notification.create({ layerChange: { layerIndex: 1 } }),
+        ).finish(),
+      }),
+    );
+    expect(screen.getByText("Layer 1")).toBeInTheDocument();
+  });
+
+  it("retires an old metadata load when the same connection changes subsystem index", async () => {
+    const data = await mockCallRpc.getMockImplementation()!();
+    let resolve!: (value: typeof data) => void;
+    const oldLayout = new Promise<typeof data>((done) => {
+      resolve = done;
+    });
+    mockCallRpc.mockReturnValueOnce(oldLayout);
+    let index = 0;
+    const app = createConnectedMockZMKApp({
+      subsystems: [SUBSYSTEM_IDENTIFIER],
+    });
+    app.findSubsystem = jest.fn(() => ({
+      index,
+      identifier: SUBSYSTEM_IDENTIFIER,
+    }));
+    const indices: number[] = [];
+    callRPCSpy.mockImplementation(function (this: ZMKCustomSubsystem) {
+      indices.push(this.getSubsystemIndex());
+      return Promise.resolve(null);
+    });
+    const view = mount(app);
+    await waitFor(() => expect(mockCallRpc).toHaveBeenCalledTimes(3));
+    index = 7;
+    view.rerender(
+      <ZMKAppProvider value={app}>
+        <InputStreamSection {...PROPS} />
+      </ZMKAppProvider>,
+    );
+    await waitFor(() => expect(mockCallRpc).toHaveBeenCalledTimes(6));
+    await started();
+    expect(indices).toEqual([7]);
+    expect(document.querySelectorAll(".keycap")).toHaveLength(2);
+    const stale = {
+      ...data,
+      keymap: {
+        ...data.keymap,
+        getPhysicalLayouts: {
+          ...data.keymap.getPhysicalLayouts,
+          layouts: [
+            {
+              ...data.keymap.getPhysicalLayouts.layouts[0],
+              keys: data.keymap.getPhysicalLayouts.layouts[0].keys.slice(0, 1),
+            },
+          ],
+        },
+      },
+    };
+    await act(async () => resolve(stale));
+    expect(document.querySelectorAll(".keycap")).toHaveLength(2);
+    expect(indices).toEqual([7]);
+  });
+
+  it.each(["success", "error"])(
+    "retires a pending disable %s after an index replacement enables the new stream",
+    async (outcome) => {
+      let index = 0;
+      const app = createConnectedMockZMKApp({
+        subsystems: [SUBSYSTEM_IDENTIFIER],
+      });
+      app.findSubsystem = jest.fn(() => ({
+        index,
+        identifier: SUBSYSTEM_IDENTIFIER,
+      }));
+      const view = mount(app);
+      await started();
+      const oldCallback = callback(app);
+      const previous = deferred();
+      const current = deferred();
+      const indices: number[] = [];
+      callRPCSpy.mockImplementation(function (this: ZMKCustomSubsystem) {
+        const target = this.getSubsystemIndex();
+        indices.push(target);
+        return target === 0 ? previous.promise : current.promise;
+      });
+      await userEvent.click(
+        screen.getByRole("button", { name: "Disable Stream" }),
+      );
+      await waitFor(() => expect(indices).toEqual([0]));
+      index = 7;
+      view.rerender(
+        <ZMKAppProvider value={app}>
+          <InputStreamSection {...PROPS} />
+        </ZMKAppProvider>,
+      );
+      await waitFor(() => expect(indices).toEqual([0, 7]));
+      await act(async () => current.resolve(null));
+      await started();
+      act(() =>
+        callback(app)({
+          subsystemIndex: 7,
+          payload: Notification.encode(
+            Notification.create({
+              keyEvent: {
+                position: 0,
+                pressed: true,
+                behaviorId: 99,
+                param1: 4,
+                param2: 0,
+              },
+            }),
+          ).finish(),
+        }),
+      );
+      expect(document.querySelector(".keycap")).toHaveClass("keycap-pressed");
+      await act(async () =>
+        previous.resolve(
+          outcome === "success"
+            ? null
+            : Response.encode(
+                Response.create({
+                  error: { message: "retired disable refusal" },
+                }),
+              ).finish(),
+        ),
+      );
+      expect(
+        screen.getByRole("button", { name: "Disable Stream" }),
+      ).toBeInTheDocument();
+      expect(document.querySelector(".keycap")).toHaveClass("keycap-pressed");
+      expect(
+        document.querySelector(".error-bar")?.textContent ?? "",
+      ).not.toContain("retired disable refusal");
+      send(oldCallback, false);
+      expect(document.querySelector(".keycap")).toHaveClass("keycap-pressed");
+    },
+  );
 });

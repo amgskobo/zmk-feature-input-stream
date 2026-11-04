@@ -13,11 +13,39 @@ acknowledgements. Unlock alone does not restart a revoked stream; enable it
 explicitly. The firmware also stops the stream when the keyboard's output
 switches (USB or BLE), and nothing tells the client: the button still reads
 Disable Stream while no events arrive. Click it, then Enable Stream, to resume.
+The Disconnect button sends Disable Stream before invoking the connection
+abort. A 15-second firmware lease (configurable 10–120 seconds) also stops a
+stream when a tab or process disappears. The current viewer renews every two
+seconds using the nonzero epoch from enable and `renew_only=true`; an expired
+or stale renewal never starts a session. Older viewers must add this renewal
+or their streams expire; older firmware does not supply the lease guarantee.
+Disable errors leave a retry action while renewal stops. Pending renewal
+responses cannot update the view after stop, lock or session replacement.
+
 The firmware can discard reports when its queue is full; it checks
 authorization again before encoding a selected payload. Bytes already encoded
 or handed to the transport cannot be recalled. The schema has no
-snapshot, sequence or session identifier, so loss recovery and complete physical
+held-key snapshot, sequence or notification epoch, so loss recovery and complete physical
 transport delivery are not guaranteed.
+
+Layer notifications must identify a loaded keymap layer. Invalid indices are
+ignored, and transparent-binding fallback examines at most the loaded layer
+count. A valid 32-bit active-layer mask uses current indices, respecting
+reordered stable IDs and the default-layer cutoff. The initial/renewal response
+provides the same snapshot. Without that information, labels stay blank until
+the top layer is known; an older mask-less notification permits only its direct
+nontransparent binding, with transparent fallback left unknown.
+Loaded metadata is published before the enable request, so valid layer
+events arriving before its acknowledgement are retained.
+
+Failed enables restore the previously confirmed history, ever-pressed marks
+and known layer state as well as clearing held highlights. This rolls back
+provisional visualization without deleting confirmed results from a prior stream.
+
+The connection and custom subsystem index identify one client session. Replacing
+either clears its view and reloads metadata before starting the current stream.
+Old load, enable/disable replies and notification callbacks cannot update the
+replacement view. Requests already sent can still complete on the device.
 
 Run from this directory:
 

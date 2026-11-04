@@ -26,6 +26,9 @@ struct zmk_rpc_custom_subsystem test_subsystems[2] = {{"other"}, {"zmk__input_st
 size_t test_subsystem_count = 2;
 unsigned test_subsystem_lookups;
 static uint8_t layer_index;
+static bool reordered_layers;
+static const uint8_t reordered_ids[] = {5, 7, 2, 1};
+static uint32_t active_layer_ids;
 static const struct zmk_behavior_binding binding = {
     .behavior_dev = "test", .param1 = UINT32_MAX, .param2 = 17};
 static bool binding_gate;
@@ -43,8 +46,18 @@ K_SEM_DEFINE(binding_entered, 0, 1);
 K_SEM_DEFINE(binding_release, 0, 1);
 zmk_keymap_layer_index_t zmk_keymap_highest_layer_active(void) { return layer_index; }
 zmk_keymap_layer_id_t zmk_keymap_layer_index_to_id(zmk_keymap_layer_index_t idx) {
-    CHECK(idx == layer_index);
-    return 7;
+    CHECK(idx < 32);
+    if (reordered_layers)
+        return idx < ARRAY_SIZE(reordered_ids) ? reordered_ids[idx] : UINT8_MAX;
+    if (idx >= 3)
+        return UINT8_MAX;
+    return idx == layer_index ? 7 : idx;
+}
+zmk_keymap_layer_id_t zmk_keymap_layer_default(void) {
+    return reordered_layers ? 7 : (layer_index == 0 ? 7 : 0);
+}
+zmk_keymap_layers_state_t zmk_keymap_layer_state(void) {
+    return reordered_layers ? active_layer_ids : BIT(7);
 }
 const struct zmk_behavior_binding *zmk_keymap_get_layer_binding_at_idx(zmk_keymap_layer_id_t id,
                                                                        uint16_t pos) {
@@ -175,6 +188,11 @@ static void call_bytes(const uint8_t *bytes, size_t size, bool ok) {
           (ok ? zmk_input_stream_Response_ok_tag : zmk_input_stream_Response_error_tag));
     if (!ok)
         CHECK(r.response_type.error.message[0]);
+    else {
+        CHECK(r.response_type.ok.has_layer_state);
+        CHECK(r.response_type.ok.lease_ms == CONFIG_ZMK_INPUT_STREAM_LEASE_MS);
+        CHECK(r.response_type.ok.stream_epoch == (streaming_enabled ? stream_epoch : 0));
+    }
 }
 static void stream_try(bool enabled, bool ok) {
     zmk_input_stream_Request req = zmk_input_stream_Request_init_zero;
@@ -186,16 +204,27 @@ static void stream_try(bool enabled, bool ok) {
     call_bytes(bytes, s.bytes_written, ok);
 }
 static void stream(bool enabled) { stream_try(enabled, true); }
+static void renew(uint32_t epoch, bool ok) {
+    zmk_input_stream_Request req = zmk_input_stream_Request_init_zero;
+    req.which_request_type = zmk_input_stream_Request_enable_stream_tag;
+    req.request_type.enable_stream.renew_only = true;
+    req.request_type.enable_stream.stream_epoch = epoch;
+    uint8_t bytes[128];
+    pb_ostream_t output = pb_ostream_from_buffer(bytes, sizeof(bytes));
+    CHECK(pb_encode(&output, zmk_input_stream_Request_fields, &req));
+    call_bytes(bytes, output.bytes_written, ok);
+}
 static void key(uint32_t pos, bool state) {
     CHECK(raise_zmk_position_state_changed((struct zmk_position_state_changed){
               .position = pos, .state = state, .timestamp = 17}) == 0);
 }
 K_SEM_DEFINE(block_entered, 0, 1);
 K_SEM_DEFINE(block_release, 0, 1);
+static uint32_t block_timeout_ms = 500;
 static void block_fn(struct k_work *work) {
     ARG_UNUSED(work);
     k_sem_give(&block_entered);
-    CHECK(k_sem_take(&block_release, K_MSEC(500)) == 0);
+    CHECK(k_sem_take(&block_release, K_MSEC(block_timeout_ms)) == 0);
 }
 K_WORK_DEFINE(block_work, block_fn);
 static void block(void) {
@@ -456,6 +485,68 @@ int main(void) {
         idle();
         CHECK(sent_count == 2 && sent[1].notification_type.key_event.position == 2);
         CHECK(test_subsystem_lookups == 3);
+    } else if (!strcmp(scenario, "lease-expiry")) {
+        stream(true);
+        uint32_t expired_epoch = stream_epoch;
+        CHECK(expired_epoch != 0);
+        block_timeout_ms = 3000;
+        block();
+        key(1, true);
+        CHECK(k_msgq_num_used_get(&notif_queue) == 1);
+        k_sleep(K_MSEC(CONFIG_ZMK_INPUT_STREAM_LEASE_MS + 20));
+        CHECK(!streaming_enabled && k_msgq_num_used_get(&notif_queue) == 0);
+        renew(expired_epoch, false);
+        unblock();
+        idle();
+        CHECK(sent_count == 0);
+        /* A completed cleanup must not turn an old renewal into a new enable. */
+        renew(expired_epoch, false);
+        CHECK(!streaming_enabled);
+        stream(true);
+        CHECK(stream_epoch != expired_epoch && stream_epoch != 0);
+        renew(expired_epoch, false);
+        renew(0, false);
+        renew(stream_epoch, true);
+        key(2, true);
+        idle();
+        CHECK(sent_count == 1 && sent[0].notification_type.key_event.position == 2);
+        stream(false);
+    } else if (!strcmp(scenario, "lease-renewal")) {
+        stream(true);
+        uint32_t epoch = stream_epoch;
+        k_sleep(K_MSEC(CONFIG_ZMK_INPUT_STREAM_LEASE_MS / 2));
+        renew(epoch, true);
+        CHECK(stream_epoch == epoch);
+        k_sleep(K_MSEC(CONFIG_ZMK_INPUT_STREAM_LEASE_MS / 2 + 20));
+        key(1, true);
+        idle();
+        CHECK(streaming_enabled && sent_count == 1);
+        k_sleep(K_MSEC(CONFIG_ZMK_INPUT_STREAM_LEASE_MS / 2 + 20));
+        CHECK(!streaming_enabled);
+        renew(epoch, false);
+        CHECK(!streaming_enabled);
+    } else if (!strcmp(scenario, "layer-order")) {
+        reordered_layers = true;
+        layer_index = 3;
+        active_layer_ids = BIT(5) | BIT(1); /* active index 0 lies below default index 1 */
+        stream(true);
+        CHECK(response.response_type.ok.has_layer_state);
+        CHECK(response.response_type.ok.layer_state.active_layer_mask_valid);
+        CHECK(response.response_type.ok.layer_state.active_layer_mask == (BIT(1) | BIT(3)));
+        CHECK(raise_zmk_layer_state_changed(
+                  (struct zmk_layer_state_changed){.layer = 1, .state = true}) == 0);
+        idle();
+        CHECK(sent_count == 1);
+        CHECK(sent[0].notification_type.layer_change.layer_index == 3);
+        CHECK(sent[0].notification_type.layer_change.active_layer_mask == (BIT(1) | BIT(3)));
+        active_layer_ids |= BIT(2); /* middle layer changes while highest remains 3 */
+        CHECK(raise_zmk_layer_state_changed(
+                  (struct zmk_layer_state_changed){.layer = 2, .state = true}) == 0);
+        idle();
+        CHECK(sent_count == 2);
+        CHECK(sent[1].notification_type.layer_change.active_layer_mask ==
+              (BIT(1) | BIT(2) | BIT(3)));
+        CHECK(sent[1].notification_type.layer_change.active_layer_mask_valid);
     } else {
         printk("unknown scenario\n");
         exit(2);

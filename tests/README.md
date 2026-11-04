@@ -62,7 +62,7 @@ event-pattern bytes are excluded from whitespace rewriting.
 
 ## Sender registry lookup
 
-The canonical firmware entry retains all prior cases and runs fourteen sender
+The canonical firmware entry retains all prior cases and runs seventeen sender
 scenarios three times. `lookup` counts visits to the controlled registry while
 the real sender dispatches ordered, decoded reports: after one successful scan,
 later reports and enable sessions perform no further scan. `missing` verifies
@@ -93,3 +93,47 @@ native scenario, wrong-role and unrelated-fixture controls.
 It runs all configured Jest scenarios in one worker process. The pre-commit
 Jest hook dispatches this same owner entry so nested workers do not multiply
 the global container budget. Build and lint retain their separate package entries.
+
+The Web layer-bound regressions use the actual App and protobuf notifications.
+A guarded layer array counts existing rendering accesses and stops an unsafe
+original scan before billions of operations. Invalid uint32 indices must leave
+the last valid layer intact, followed by normal event recovery. A synchronous
+first-layer event before the enable acknowledgement remains accepted.
+`web/bindings.spec.ts` separately retains transparent fallback, empty/first/last
+layers, stale indices and independent positions with a loaded-layer work bound.
+
+The same App/codec fixture replaces only the provider's subsystem index while
+retaining its connection. Pending enable/disable success and error replies, old
+notifications and a deferred metadata load must retire; a current-index stream
+still starts and accepts valid layers. This is client/provider replacement
+coverage, not a claim that the firmware's boot registry changes dynamically.
+
+## Lease and layer-state regressions
+
+The sender suite retains all fourteen original scenarios and adds
+`lease-expiry`, `lease-renewal` and `layer-order`. The same binary executes
+each scenario three times in fresh processes. A timer revokes and purges while
+the low-priority queue is deliberately blocked; renewal succeeds only for the
+current nonzero epoch and never enables a retired stream, including after
+cleanup and after a replacement enable. The reordered layer fixture checks
+current-index mask bits, exclusion below the default and a middle-layer change
+that leaves the highest layer unchanged. Initial and renewal replies encode
+and decode the real layer-state submessage and its presence flag.
+
+`tests/web/lease.spec.tsx` exercises the actual App/codec with deferred replies:
+tokenized renewal and unmount retirement, Disable before connection abort,
+rejected renewal without auto-enable, late renewal after stop, full provisional
+visualization rollback, preservation of confirmed history, initial mask-based
+labels and conservative legacy/malformed-mask fallback. Existing uint32 layer
+bounds and provider/index lifecycle assertions remain unchanged.
+
+For negative controls, prepare an isolated owner source copy in container
+storage and run `python3 tests/review_negative_control.py FAULT "$ISOLATED_OWNER"`
+from the unchanged owner. `lease-expiry`, `late-renewal`, `default-filter` and
+`layer-id-mask` must fail their corresponding real-kernel assertions.
+`provisional-mark` and `inactive-fallback` must fail the unchanged Web cases.
+The operator rejects the authoring owner. Preserve the first executable
+assertion failure and all required repeats; compilation/link failures do not
+establish a negative control. These synthetic boundaries do not prove physical
+USB/BLE delivery, a held-key resynchronization guarantee or interruption of a
+Studio TX call already committed by the core.

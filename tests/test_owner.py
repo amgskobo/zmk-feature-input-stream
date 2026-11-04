@@ -126,7 +126,7 @@ class WestCommandsTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(
-            "Completed input-stream sender scenarios=14 repeats=3", result.stdout
+            "Completed input-stream sender scenarios=17 repeats=3", result.stdout
         )
 
     def _test_zmk_build(

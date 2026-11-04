@@ -117,13 +117,37 @@ The Web client listens to Studio's lock notification, clears held-key highlights
 and rejects a pending enable acknowledgement from before that lock. Unlock does
 not resume a previously revoked stream; click Enable Stream again.
 
+Streaming has a **15-second client lease** by default
+(`CONFIG_ZMK_INPUT_STREAM_LEASE_MS`, range 10–120 seconds). The enable response
+returns its nonzero `stream_epoch` and lease length. The Web client renews every
+two seconds with `EnableStream{renew_only: true, stream_epoch}`. Renew-only
+requests never create a stream: missing, expired or old epochs are rejected,
+including after a new stream has been enabled. An independent kernel timer
+revokes authorization and purges queued reports even if the sender is blocked.
+It cannot interrupt an already committed encoder pass or a stalled core TX call.
+Explicit legacy enable requests remain accepted; **older viewers must implement
+renewal or streaming expires after one lease**. Older firmware does not provide
+this lease guarantee and should be updated alongside the viewer.
+
+The Disconnect control sends Disable Stream while its connection is still
+available, then closes it even if that request fails. Closing a tab or losing
+the browser process stops renewal; the firmware lease bounds orphaned streaming.
+
 The web client clears held-key highlights after a successful stop and ignores
 notifications while disabled. Replacing the connection clears its view state;
 old callbacks and unfinished RPC responses cannot reactivate the new view.
-Events arriving before a successful enable acknowledgement are accepted, then
-discarded if that enable fails. Disable errors leave the stream active for retry.
-These rules cannot distinguish an old wire packet delivered after re-enable:
-the unchanged protocol has no session identifier.
+Events arriving before a successful enable acknowledgement are provisional.
+If enable fails, held keys clear and the previous history, ever-pressed marks
+and known layer state are restored. Disable errors retain retry controls while
+renewal is stopped. Notification packets do not carry the control epoch, so
+an old wire packet delivered after re-enable cannot be identified from it.
+
+Enable/renew responses and layer notifications include an active-layer mask
+whose bits refer to current keymap indices, accounting for stable-ID reordering
+and the current default-layer cutoff. Transparent labels search only those
+active indices. A mask validity flag distinguishes older firmware: until a
+layer is known its labels stay blank, and without a valid mask transparent
+fallback remains blank rather than using a possibly inactive lower layer.
 
 A selected dispatch may still block after disable, but its payload is rejected
 before its first encoder pass. Nanopb's sizing and output passes share that
@@ -135,7 +159,7 @@ does not guarantee progress while that call is blocked.
 
 Queue overflow drops excess notifications. A lost release can leave the client
 visualization pressed until a later matching event or client reset. The current
-schema has no state snapshot, sequence or session identifier, so reconnect and
+notifications have no held-key snapshot, sequence or epoch, so reconnect and
 loss recovery are not guaranteed. These are Studio visualization notifications,
 not the keyboard's HID key delivery path.
 

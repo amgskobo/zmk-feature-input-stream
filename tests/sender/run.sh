@@ -32,7 +32,7 @@ cp "$work/build.log" "$work/build/CMakeCache.txt" "$out/"
 cp "$work/build/zephyr/.config" "$out/config"
 cp "$work/build/zephyr/zephyr.elf" "$work/build/zephyr/zephyr.exe" "$out/"
 failed=0
-for scenario in control stop restart full fair race missing blocking locked lock-race lock-dispatch endpoint encoding lookup; do
+for scenario in control stop restart full fair race missing blocking locked lock-race lock-dispatch endpoint encoding lookup lease-expiry lease-renewal layer-order; do
     for run in 1 2 3; do
         status=0
         INPUT_STREAM_CASE="$scenario" timeout 15 "$work/build/zephyr/zephyr.exe" > "$out/$scenario-$run.log" 2>&1 || status=$?
@@ -41,5 +41,5 @@ for scenario in control stop restart full fair race missing blocking locked lock
         [ "$status" = 0 ] || failed=1
     done
 done
-echo 'Completed input-stream sender scenarios=14 repeats=3'
+echo 'Completed input-stream sender scenarios=17 repeats=3'
 exit "$failed"

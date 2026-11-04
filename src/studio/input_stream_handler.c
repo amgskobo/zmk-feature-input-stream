@@ -25,6 +25,7 @@ LOG_MODULE_REGISTER(zmk_input_stream_fork_input_stream_handler,
 static struct k_spinlock notif_lock;
 static bool streaming_enabled;
 static uint32_t stream_epoch;
+static int64_t stream_lease_deadline;
 static uint32_t notifications_queued, notifications_dropped;
 
 static struct zmk_rpc_custom_subsystem_meta input_stream_meta = {
@@ -74,6 +75,7 @@ static struct notification_encoding s_notification;
 static bool stream_epoch_is_current(uint32_t epoch) {
     k_spinlock_key_t key = k_spin_lock(&notif_lock);
     bool current = streaming_enabled && epoch == stream_epoch &&
+                   stream_lease_deadline > k_uptime_get() &&
                    zmk_studio_core_get_lock_state() == ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED;
     k_spin_unlock(&notif_lock, key);
     return current;
@@ -126,9 +128,39 @@ K_MSGQ_DEFINE(notif_queue, sizeof(struct queued_notification),
 static void notif_send_work_handler(struct k_work *work);
 static K_WORK_DEFINE(notif_send_work, notif_send_work_handler);
 
+/* Caller owns notif_lock. Epoch zero is reserved for missing renewal tokens. */
+static void advance_stream_epoch_locked(void) {
+    stream_epoch++;
+    if (stream_epoch == 0)
+        stream_epoch = 1;
+}
+
+static void retire_stream_locked(void) {
+    advance_stream_epoch_locked();
+    streaming_enabled = false;
+    stream_lease_deadline = 0;
+    k_msgq_purge(&notif_queue);
+}
+
+static void stream_lease_expired(struct k_timer *timer) {
+    ARG_UNUSED(timer);
+    k_spinlock_key_t key = k_spin_lock(&notif_lock);
+    if (streaming_enabled && stream_lease_deadline <= k_uptime_get()) {
+        retire_stream_locked();
+    }
+    k_spin_unlock(&notif_lock, key);
+}
+
+static K_TIMER_DEFINE(stream_lease_timer, stream_lease_expired, NULL);
+
+static void renew_stream_lease_locked(void) {
+    stream_lease_deadline = k_uptime_get() + CONFIG_ZMK_INPUT_STREAM_LEASE_MS;
+    k_timer_start(&stream_lease_timer, K_MSEC(CONFIG_ZMK_INPUT_STREAM_LEASE_MS), K_NO_WAIT);
+}
+
 static bool capture_stream_epoch(uint32_t *epoch) {
     k_spinlock_key_t key = k_spin_lock(&notif_lock);
-    bool enabled = streaming_enabled &&
+    bool enabled = streaming_enabled && stream_lease_deadline > k_uptime_get() &&
                    zmk_studio_core_get_lock_state() == ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED;
     *epoch = stream_epoch;
     k_spin_unlock(&notif_lock, key);
@@ -141,11 +173,19 @@ static bool set_stream_enabled(bool enabled) {
         k_spin_unlock(&notif_lock, key);
         return false;
     }
+    if (streaming_enabled && stream_lease_deadline <= k_uptime_get()) {
+        retire_stream_locked();
+    }
     const bool changed = streaming_enabled != enabled;
     if (changed) {
-        stream_epoch++;
+        advance_stream_epoch_locked();
         streaming_enabled = enabled;
         k_msgq_purge(&notif_queue);
+    }
+    if (enabled) {
+        renew_stream_lease_locked();
+    } else {
+        stream_lease_deadline = 0;
     }
     const uint32_t epoch = stream_epoch;
     const uint32_t queued = notifications_queued;
@@ -157,11 +197,23 @@ static bool set_stream_enabled(bool enabled) {
     return true;
 }
 
+static bool renew_stream(uint32_t epoch) {
+    k_spinlock_key_t key = k_spin_lock(&notif_lock);
+    bool current = epoch != 0 && epoch == stream_epoch && streaming_enabled &&
+                   stream_lease_deadline > k_uptime_get() &&
+                   zmk_studio_core_get_lock_state() == ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED;
+    if (current)
+        renew_stream_lease_locked();
+    k_spin_unlock(&notif_lock, key);
+    return current;
+}
+
 static void notif_send_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
     struct queued_notification item;
     k_spinlock_key_t key = k_spin_lock(&notif_lock);
-    bool send = streaming_enabled && k_msgq_get(&notif_queue, &item, K_NO_WAIT) == 0;
+    bool send = streaming_enabled && stream_lease_deadline > k_uptime_get() &&
+                k_msgq_get(&notif_queue, &item, K_NO_WAIT) == 0;
     if (send) {
         send = item.epoch == stream_epoch;
     }
@@ -174,7 +226,8 @@ static void notif_send_work_handler(struct k_work *work) {
     }
 
     key = k_spin_lock(&notif_lock);
-    bool more = streaming_enabled && k_msgq_num_used_get(&notif_queue) > 0;
+    bool more = streaming_enabled && stream_lease_deadline > k_uptime_get() &&
+                k_msgq_num_used_get(&notif_queue) > 0;
     k_spin_unlock(&notif_lock, key);
     if (more) {
         k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &notif_send_work);
@@ -190,6 +243,7 @@ static void enqueue_notification(const zmk_input_stream_Notification *notif, uin
     struct queued_notification item = {.payload = *notif, .epoch = epoch};
     k_spinlock_key_t key = k_spin_lock(&notif_lock);
     bool queued = streaming_enabled && epoch == stream_epoch &&
+                  stream_lease_deadline > k_uptime_get() &&
                   k_msgq_put(&notif_queue, &item, K_NO_WAIT) == 0;
     if (queued) {
         notifications_queued++;
@@ -203,6 +257,47 @@ static void enqueue_notification(const zmk_input_stream_Notification *notif, uin
 }
 
 /* ── RPC handler ───────────────────────────────────────────────────────── */
+
+static void fill_layer_state(zmk_input_stream_LayerChangeNotification *out) {
+    out->layer_index = zmk_keymap_highest_layer_active();
+    out->active_layer_mask = 0;
+    out->active_layer_mask_valid = false;
+    /* The selected core's layer state is uint32. Mapping each index through
+     * the public API preserves reordered stable IDs and removed-layer slots. */
+    zmk_keymap_layers_state_t state = zmk_keymap_layer_state();
+    zmk_keymap_layer_id_t default_id = zmk_keymap_layer_default();
+    if (default_id >= 32)
+        return;
+    zmk_keymap_layer_id_t ids[32];
+    uint32_t default_index = 32;
+    for (uint32_t index = 0; index < ARRAY_SIZE(ids); index++) {
+        ids[index] = zmk_keymap_layer_index_to_id(index);
+        if (ids[index] == default_id)
+            default_index = index;
+    }
+    if (default_index == 32 || out->layer_index >= 32)
+        return;
+    for (uint32_t index = default_index; index < ARRAY_SIZE(ids); index++) {
+        if (ids[index] < 32 && ((state & BIT(ids[index])) || ids[index] == default_id)) {
+            out->active_layer_mask |= BIT(index);
+        }
+    }
+    /* A concurrent core edit can invalidate this observational snapshot.
+     * Report unknown fallback rather than claiming an inconsistent mask. */
+    out->active_layer_mask_valid =
+        (out->active_layer_mask & BIT(out->layer_index)) &&
+        (out->layer_index == 31 || (out->active_layer_mask >> (out->layer_index + 1)) == 0);
+}
+
+static void fill_ok_response(zmk_input_stream_OkResponse *out) {
+    out->has_layer_state = true;
+    fill_layer_state(&out->layer_state);
+    k_spinlock_key_t key = k_spin_lock(&notif_lock);
+    out->stream_epoch =
+        streaming_enabled && stream_lease_deadline > k_uptime_get() ? stream_epoch : 0;
+    out->lease_ms = CONFIG_ZMK_INPUT_STREAM_LEASE_MS;
+    k_spin_unlock(&notif_lock, key);
+}
 
 static bool input_stream_rpc_handle_request(const zmk_custom_CallRequest *raw_request,
                                             pb_callback_t *encode_response) {
@@ -223,10 +318,12 @@ static bool input_stream_rpc_handle_request(const zmk_custom_CallRequest *raw_re
 
     switch (req.which_request_type) {
     case zmk_input_stream_Request_enable_stream_tag:
-        if (!set_stream_enabled(true)) {
+        if (!(req.request_type.enable_stream.renew_only
+                  ? renew_stream(req.request_type.enable_stream.stream_epoch)
+                  : set_stream_enabled(true))) {
             resp->which_response_type = zmk_input_stream_Response_error_tag;
             snprintf(resp->response_type.error.message, sizeof(resp->response_type.error.message),
-                     "Unlock required");
+                     "Stream locked, expired or changed; enable explicitly");
             break;
         }
         resp->which_response_type = zmk_input_stream_Response_ok_tag;
@@ -244,6 +341,9 @@ static bool input_stream_rpc_handle_request(const zmk_custom_CallRequest *raw_re
             resp->response_type.error = err;
         }
         break;
+    }
+    if (resp->which_response_type == zmk_input_stream_Response_ok_tag) {
+        fill_ok_response(&resp->response_type.ok);
     }
     return true;
 }
@@ -291,7 +391,7 @@ static int on_layer_state_changed(const zmk_event_t *eh) {
 
     zmk_input_stream_Notification notif = zmk_input_stream_Notification_init_zero;
     notif.which_notification_type = zmk_input_stream_Notification_layer_change_tag;
-    notif.notification_type.layer_change.layer_index = zmk_keymap_highest_layer_active();
+    fill_layer_state(&notif.notification_type.layer_change);
 
     enqueue_notification(&notif, epoch);
     return ZMK_EV_EVENT_BUBBLE;

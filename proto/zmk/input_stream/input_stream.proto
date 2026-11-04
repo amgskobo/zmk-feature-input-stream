@@ -2,7 +2,12 @@ syntax = "proto3";
 
 package zmk.input_stream;
 
-message EnableStreamRequest {}
+message EnableStreamRequest {
+    // Renewal never starts a session. It requires the nonzero epoch returned
+    // by the original explicit enable; missing/stale epochs are rejected.
+    bool renew_only = 1;
+    uint32 stream_epoch = 2;
+}
 
 message DisableStreamRequest {}
 
@@ -15,7 +20,11 @@ message Request {
 
 message ErrorResponse { string message = 1; }
 
-message OkResponse {}
+message OkResponse {
+    LayerChangeNotification layer_state = 1;
+    uint32 stream_epoch = 2;
+    uint32 lease_ms = 3;
+}
 
 message Response {
     oneof response_type {
@@ -34,8 +43,14 @@ message KeyEventNotification {
     uint32 param2 = 5;
 }
 
-// Sent whenever the highest-active-layer index changes.
-message LayerChangeNotification { uint32 layer_index = 1; }
+// Sent when layer state changes. Bits use current keymap indices, not stable
+// layer IDs, and exclude indices below the current default layer.
+message LayerChangeNotification {
+    uint32 layer_index = 1;
+    uint32 active_layer_mask = 2;
+    // Explicit presence lets newer viewers avoid guessing with older firmware.
+    bool active_layer_mask_valid = 3;
+}
 
 message Notification {
     oneof notification_type {

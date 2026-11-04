@@ -23,6 +23,11 @@ import {
   Response,
   Notification,
 } from "./proto/zmk/input_stream/input_stream";
+import {
+  getEffectiveBinding,
+  isValidActiveLayerMask,
+  isValidLayerIndex,
+} from "./bindings";
 
 export const SUBSYSTEM_IDENTIFIER = "zmk__input_stream";
 
@@ -126,33 +131,9 @@ function hidUsageToLabel(usage: number): string {
 }
 
 // ─── &trans helpers ────────────────────────────────────────────────────────
-function isTransparent(
-  binding: BehaviorBinding,
-  behaviorMap: Map<number, GetBehaviorDetailsResponse>
-): boolean {
-  const det = behaviorMap.get(binding.behaviorId);
-  return det?.displayName.toLowerCase().startsWith("transparent") ?? false;
-}
-
 function isKpBehavior(det: GetBehaviorDetailsResponse): boolean {
   const n = det.displayName.toLowerCase();
   return n === "key press" || n === "kp";
-}
-
-/** Walk from fromLayer down to 0 and return first non-transparent binding. */
-function getEffectiveBinding(
-  keymap: Keymap,
-  position: number,
-  fromLayer: number,
-  behaviorMap: Map<number, GetBehaviorDetailsResponse>
-): BehaviorBinding | null {
-  for (let i = fromLayer; i >= 0; i--) {
-    const layer = keymap.layers[i];
-    if (!layer || position >= layer.bindings.length) continue;
-    const b = layer.bindings[position];
-    if (!isTransparent(b, behaviorMap)) return b;
-  }
-  return null;
 }
 
 // ─── Error helpers ────────────────────────────────────────────────────────
@@ -255,6 +236,7 @@ export function InputStreamSection({
   const zmkApp = useContext(ZMKAppContext);
   const connection = zmkApp?.state.connection ?? null;
   const subsystem = zmkApp?.findSubsystem(SUBSYSTEM_IDENTIFIER) ?? null;
+  const subsystemIndex = subsystem?.index ?? null;
 
   const [keymap, setKeymap] = useState<Keymap | null>(null);
   const [physicalLayouts, setPhysicalLayouts] =
@@ -269,6 +251,9 @@ export function InputStreamSection({
   const [streamPending, setStreamPending] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
   const [activeLayer, setActiveLayer] = useState(0);
+  const [activeLayerKnown, setActiveLayerKnown] = useState(false);
+  const [activeLayerMask, setActiveLayerMask] = useState<number | null>(null);
+  const [disconnectPending, setDisconnectPending] = useState(false);
   const [unlockPending, setUnlockPending] = useState(false);
   const [loadTrigger, setLoadTrigger] = useState(0);
 
@@ -282,19 +267,94 @@ export function InputStreamSection({
 
   // Refs to hold latest values for event handlers and effects without re-subscribing
   const streamingEnabledRef = useRef(false);
+  const keymapRef = useRef<Keymap | null>(null);
   const streamRequestRef = useRef(0);
-  const streamLifetimeRef = useRef({ active: false });
-  const [viewConnection, setViewConnection] = useState(connection);
-  const connectionRef = useRef(connection);
-  const subsystemRef = useRef(subsystem);
+  const layerRevisionRef = useRef(0);
+  const streamLeaseRef = useRef<{ epoch: number; leaseMs: number } | null>(
+    null
+  );
+  const visibleStreamRef = useRef({
+    everPressedKeys,
+    behaviorHistory,
+    activeLayer,
+    activeLayerKnown,
+    activeLayerMask,
+  });
+  useEffect(() => {
+    visibleStreamRef.current = {
+      everPressedKeys,
+      behaviorHistory,
+      activeLayer,
+      activeLayerKnown,
+      activeLayerMask,
+    };
+  }, [
+    everPressedKeys,
+    behaviorHistory,
+    activeLayer,
+    activeLayerKnown,
+    activeLayerMask,
+  ]);
+  const pendingStartRef = useRef<{
+    before: typeof visibleStreamRef.current;
+    layerReceived: boolean;
+  } | null>(null);
+  const rollbackPendingStart = useCallback(() => {
+    const pending = pendingStartRef.current;
+    if (!pending) return;
+    pendingStartRef.current = null;
+    layerRevisionRef.current++;
+    setEverPressedKeys(pending.before.everPressedKeys);
+    setBehaviorHistory(pending.before.behaviorHistory);
+    setActiveLayer(pending.before.activeLayer);
+    setActiveLayerKnown(pending.before.activeLayerKnown);
+    setActiveLayerMask(pending.before.activeLayerMask);
+  }, []);
+  const applyLayerState = useCallback(
+    (state: {
+      layerIndex: number;
+      activeLayerMask: number;
+      activeLayerMaskValid: boolean;
+    }) => {
+      const layers = keymapRef.current?.layers;
+      if (!layers || !isValidLayerIndex(state.layerIndex, layers.length))
+        return;
+      setActiveLayer(state.layerIndex);
+      setActiveLayerKnown(true);
+      setActiveLayerMask(
+        state.activeLayerMaskValid &&
+          isValidActiveLayerMask(
+            state.activeLayerMask,
+            state.layerIndex,
+            layers.length
+          )
+          ? state.activeLayerMask
+          : null
+      );
+    },
+    []
+  );
+  const streamLifetimeRef = useRef({
+    active: false,
+    connection,
+    subsystemIndex,
+  });
+  const [viewSession, setViewSession] = useState({
+    connection,
+    subsystemIndex,
+  });
   const enableStreamRef = useRef<() => Promise<void>>(() => Promise.resolve());
-  // Reset connection-owned view state before rendering the replacement device.
-  if (viewConnection !== connection) {
-    setViewConnection(connection);
+  // The subsystem catalog can replace an index without replacing its connection.
+  if (
+    viewSession.connection !== connection ||
+    viewSession.subsystemIndex !== subsystemIndex
+  ) {
+    setViewSession({ connection, subsystemIndex });
     setKeymap(null);
     setPhysicalLayouts(null);
     setBehaviorMap(new Map());
     setLoadError(null);
+    setIsLoading(false);
     setUnlockPending(false);
     setStreamingEnabled(false);
     setStreamPending(false);
@@ -302,17 +362,25 @@ export function InputStreamSection({
     setEverPressedKeys(new Set());
     setBehaviorHistory([]);
     setActiveLayer(0);
+    setActiveLayerKnown(false);
+    setActiveLayerMask(null);
+    setDisconnectPending(false);
     setStreamError(null);
   }
   useEffect(() => {
-    connectionRef.current = connection;
+    streamRequestRef.current++;
     streamingEnabledRef.current = false;
-    const lifetime = { active: true };
+    streamLeaseRef.current = null;
+    pendingStartRef.current = null;
+    layerRevisionRef.current = 0;
+    keymapRef.current = null;
+    const lifetime = { active: true, connection, subsystemIndex };
     streamLifetimeRef.current = lifetime;
     return () => {
       lifetime.active = false;
+      if (streamLifetimeRef.current === lifetime) streamLeaseRef.current = null;
     };
-  }, [connection]);
+  }, [connection, subsystemIndex]);
   // Firmware revokes the stream on Studio lock. Invalidate pending enables as
   // well as notifications; an unlock notification must not restart it.
   useEffect(() => {
@@ -327,7 +395,9 @@ export function InputStreamSection({
             LockState.ZMK_STUDIO_CORE_LOCK_STATE_LOCKED
         )
           return;
+        rollbackPendingStart();
         streamRequestRef.current++;
+        streamLeaseRef.current = null;
         streamingEnabledRef.current = false;
         setStreamingEnabled(false);
         setStreamPending(false);
@@ -341,22 +411,27 @@ export function InputStreamSection({
       subscribed = false;
       unsubscribe();
     };
-  }, [zmkApp, connection]);
-  useEffect(() => {
-    subsystemRef.current = subsystem;
-  }, [subsystem]);
+  }, [zmkApp, connection, subsystemIndex, rollbackPendingStart]);
 
   // Send disableStream on page close (best-effort)
   useEffect(() => {
     const handler = () => {
-      const conn = connectionRef.current;
-      const sys = subsystemRef.current;
-      if (!streamingEnabledRef.current || !conn || !sys) return;
-      const service = new ZMKCustomSubsystem(conn, sys.index);
+      const lifetime = streamLifetimeRef.current;
+      if (
+        !lifetime.active ||
+        !streamingEnabledRef.current ||
+        !lifetime.connection ||
+        lifetime.subsystemIndex === null
+      )
+        return;
+      const service = new ZMKCustomSubsystem(
+        lifetime.connection,
+        lifetime.subsystemIndex
+      );
       const payload = Request.encode(
         Request.create({ disableStream: {} })
       ).finish();
-      void service.callRPC(payload);
+      void service.callRPC(payload).catch(() => undefined);
     };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
@@ -365,7 +440,7 @@ export function InputStreamSection({
   // Load keymap + behaviors on connect, then auto-start streaming.
   // Retried automatically when unlockPending via loadTrigger.
   useEffect(() => {
-    if (!connection) return;
+    if (!connection || subsystemIndex === null) return;
     let cancelled = false;
     const authorizationGeneration = streamRequestRef.current;
     const load = async () => {
@@ -380,8 +455,16 @@ export function InputStreamSection({
         if (cancelled) return;
         if (layoutResp.keymap?.getPhysicalLayouts)
           setPhysicalLayouts(layoutResp.keymap.getPhysicalLayouts);
-        if (keymapResp.keymap?.getKeymap)
-          setKeymap(keymapResp.keymap.getKeymap);
+        const loadedKeymap = keymapResp.keymap?.getKeymap;
+        if (loadedKeymap) {
+          // Publish metadata before enable can synchronously deliver its first
+          // notification, including before React commits the state update.
+          keymapRef.current = loadedKeymap;
+          setKeymap(loadedKeymap);
+          setActiveLayer((current) =>
+            isValidLayerIndex(current, loadedKeymap.layers.length) ? current : 0
+          );
+        }
 
         const ids =
           behaviorListResp.behaviors?.listAllBehaviors?.behaviors ?? [];
@@ -421,17 +504,22 @@ export function InputStreamSection({
     return () => {
       cancelled = true;
     };
-  }, [connection, loadTrigger]);
+  }, [connection, subsystemIndex, loadTrigger]);
 
   // Subscribe to notifications from firmware
   useEffect(() => {
-    if (!zmkApp || !subsystem) return;
+    if (!zmkApp || subsystemIndex === null) return;
     let subscribed = true;
     const unsubscribe = zmkApp.onNotification({
       type: "custom",
-      subsystemIndex: subsystem.index,
+      subsystemIndex,
       callback: (notif: CustomNotification) => {
-        if (!subscribed || !streamingEnabledRef.current) return;
+        if (
+          !subscribed ||
+          !streamingEnabledRef.current ||
+          notif.subsystemIndex !== subsystemIndex
+        )
+          return;
         try {
           const decoded = Notification.decode(notif.payload);
           if (decoded.keyEvent) {
@@ -458,7 +546,14 @@ export function InputStreamSection({
             }
           }
           if (decoded.layerChange) {
-            setActiveLayer(decoded.layerChange.layerIndex);
+            const layerIndex = decoded.layerChange.layerIndex;
+            const layers = keymapRef.current?.layers;
+            if (layers && isValidLayerIndex(layerIndex, layers.length)) {
+              layerRevisionRef.current++;
+              if (pendingStartRef.current)
+                pendingStartRef.current.layerReceived = true;
+              applyLayerState(decoded.layerChange);
+            }
           }
         } catch {
           // ignore decode errors
@@ -469,7 +564,7 @@ export function InputStreamSection({
       subscribed = false;
       unsubscribe();
     };
-  }, [zmkApp, subsystem, behaviorMap]);
+  }, [zmkApp, subsystemIndex, behaviorMap, applyLayerState]);
 
   // Capture JS key events
   useEffect(() => {
@@ -496,40 +591,82 @@ export function InputStreamSection({
 
   // Enable streaming after data loads
   const enableStream = useCallback(async () => {
-    if (!connection || !subsystem) return;
-    const requestId = ++streamRequestRef.current;
     const lifetime = streamLifetimeRef.current;
+    if (
+      !connection ||
+      subsystemIndex === null ||
+      !lifetime.active ||
+      lifetime.connection !== connection ||
+      lifetime.subsystemIndex !== subsystemIndex
+    )
+      return;
+    const requestId = ++streamRequestRef.current;
+    streamLeaseRef.current = null;
+    pendingStartRef.current = {
+      before: visibleStreamRef.current,
+      layerReceived: false,
+    };
     // Firmware may emit events before the enable response reaches the browser.
     streamingEnabledRef.current = true;
     setStreamPending(true);
     setStreamError(null);
     try {
-      const service = new ZMKCustomSubsystem(connection, subsystem.index);
+      const service = new ZMKCustomSubsystem(connection, subsystemIndex);
       const payload = Request.encode(
         Request.create({ enableStream: {} })
       ).finish();
       const respPayload = await service.callRPC(payload);
-      if (!lifetime.active || requestId !== streamRequestRef.current) return;
+      if (
+        !lifetime.active ||
+        lifetime !== streamLifetimeRef.current ||
+        requestId !== streamRequestRef.current
+      )
+        return;
       if (respPayload) {
         const resp = Response.decode(respPayload);
         if (resp.error) {
           streamingEnabledRef.current = false;
+          setStreamingEnabled(false);
           setPressedKeys(new Set());
+          rollbackPendingStart();
           setStreamError(resp.error.message);
           return;
         }
+        if (resp.ok?.leaseMs && !resp.ok.streamEpoch)
+          throw new Error("Stream lease expired before enable acknowledgement");
+        if (resp.ok?.streamEpoch && resp.ok.leaseMs) {
+          streamLeaseRef.current = {
+            epoch: resp.ok.streamEpoch,
+            leaseMs: resp.ok.leaseMs,
+          };
+        }
+        if (resp.ok?.layerState && !pendingStartRef.current?.layerReceived)
+          applyLayerState(resp.ok.layerState);
       }
+      pendingStartRef.current = null;
       setStreamingEnabled(true);
     } catch (e) {
-      if (!lifetime.active || requestId !== streamRequestRef.current) return;
+      if (
+        !lifetime.active ||
+        lifetime !== streamLifetimeRef.current ||
+        requestId !== streamRequestRef.current
+      )
+        return;
       streamingEnabledRef.current = false;
+      setStreamingEnabled(false);
+      streamLeaseRef.current = null;
       setPressedKeys(new Set());
+      rollbackPendingStart();
       setStreamError(friendlyError(e));
     } finally {
-      if (lifetime.active && requestId === streamRequestRef.current)
+      if (
+        lifetime.active &&
+        lifetime === streamLifetimeRef.current &&
+        requestId === streamRequestRef.current
+      )
         setStreamPending(false);
     }
-  }, [connection, subsystem]);
+  }, [connection, subsystemIndex, rollbackPendingStart, applyLayerState]);
 
   // Keep ref in sync so the load effect can call the latest enableStream
   useEffect(() => {
@@ -541,23 +678,36 @@ export function InputStreamSection({
     if (!unlockPending || !connection) return;
     const id = setInterval(() => setLoadTrigger((t) => t + 1), 2000);
     return () => clearInterval(id);
-  }, [unlockPending, connection]);
+  }, [unlockPending, connection, subsystemIndex]);
 
   // Stream toggle button handler
   const toggleStreaming = useCallback(async () => {
-    if (!connection || !subsystem) return;
+    const lifetime = streamLifetimeRef.current;
+    if (
+      !connection ||
+      subsystemIndex === null ||
+      !lifetime.active ||
+      lifetime.connection !== connection ||
+      lifetime.subsystemIndex !== subsystemIndex
+    )
+      return;
     if (streamingEnabled) {
       const requestId = ++streamRequestRef.current;
-      const lifetime = streamLifetimeRef.current;
+      streamLeaseRef.current = null;
       setStreamPending(true);
       setStreamError(null);
       try {
-        const service = new ZMKCustomSubsystem(connection, subsystem.index);
+        const service = new ZMKCustomSubsystem(connection, subsystemIndex);
         const payload = Request.encode(
           Request.create({ disableStream: {} })
         ).finish();
         const respPayload = await service.callRPC(payload);
-        if (!lifetime.active || requestId !== streamRequestRef.current) return;
+        if (
+          !lifetime.active ||
+          lifetime !== streamLifetimeRef.current ||
+          requestId !== streamRequestRef.current
+        )
+          return;
         if (respPayload) {
           const resp = Response.decode(respPayload);
           if (resp.error) {
@@ -569,16 +719,122 @@ export function InputStreamSection({
         setStreamingEnabled(false);
         setPressedKeys(new Set());
       } catch (e) {
-        if (!lifetime.active || requestId !== streamRequestRef.current) return;
+        if (
+          !lifetime.active ||
+          lifetime !== streamLifetimeRef.current ||
+          requestId !== streamRequestRef.current
+        )
+          return;
         setStreamError(friendlyError(e));
       } finally {
-        if (lifetime.active && requestId === streamRequestRef.current)
+        if (
+          lifetime.active &&
+          lifetime === streamLifetimeRef.current &&
+          requestId === streamRequestRef.current
+        )
           setStreamPending(false);
       }
     } else {
       await enableStream();
     }
-  }, [connection, subsystem, streamingEnabled, enableStream]);
+  }, [connection, subsystemIndex, streamingEnabled, enableStream]);
+
+  useEffect(() => {
+    const lease = streamLeaseRef.current;
+    const lifetime = streamLifetimeRef.current;
+    if (
+      !streamingEnabled ||
+      !lease ||
+      !lifetime.connection ||
+      lifetime.subsystemIndex === null
+    )
+      return;
+    const requestId = streamRequestRef.current;
+    let retired = false;
+    let pending = false;
+    const isCurrent = () =>
+      !retired &&
+      lifetime.active &&
+      lifetime === streamLifetimeRef.current &&
+      requestId === streamRequestRef.current &&
+      lease === streamLeaseRef.current;
+    const timer = window.setInterval(() => {
+      if (!isCurrent() || pending) return;
+      pending = true;
+      const layerRevision = layerRevisionRef.current;
+      const service = new ZMKCustomSubsystem(
+        lifetime.connection!,
+        lifetime.subsystemIndex!
+      );
+      const payload = Request.encode(
+        Request.create({
+          enableStream: { renewOnly: true, streamEpoch: lease.epoch },
+        })
+      ).finish();
+      void service
+        .callRPC(payload)
+        .then((bytes) => {
+          if (!isCurrent()) return;
+          if (!bytes) throw new Error("Stream renewal response missing");
+          const response = Response.decode(bytes);
+          if (response.error) throw new Error(response.error.message);
+          if (!response.ok || response.ok.streamEpoch !== lease.epoch)
+            throw new Error("Stream lease expired or changed");
+          if (
+            response.ok.layerState &&
+            layerRevision === layerRevisionRef.current
+          )
+            applyLayerState(response.ok.layerState);
+        })
+        .catch((error: unknown) => {
+          if (!isCurrent()) return;
+          streamRequestRef.current++;
+          streamLeaseRef.current = null;
+          streamingEnabledRef.current = false;
+          setStreamingEnabled(false);
+          setPressedKeys(new Set());
+          setStreamError(friendlyError(error));
+        })
+        .finally(() => {
+          pending = false;
+        });
+    }, 2000);
+    return () => {
+      retired = true;
+      window.clearInterval(timer);
+    };
+  }, [streamingEnabled, connection, subsystemIndex, applyLayerState]);
+
+  const disconnectStream = useCallback(async () => {
+    const lifetime = streamLifetimeRef.current;
+    if (disconnectPending || !lifetime.active) return;
+    streamRequestRef.current++;
+    streamLeaseRef.current = null;
+    streamingEnabledRef.current = false;
+    rollbackPendingStart();
+    setStreamingEnabled(false);
+    setStreamPending(false);
+    setPressedKeys(new Set());
+    setDisconnectPending(true);
+    try {
+      if (lifetime.connection && lifetime.subsystemIndex !== null) {
+        const service = new ZMKCustomSubsystem(
+          lifetime.connection,
+          lifetime.subsystemIndex
+        );
+        await service.callRPC(
+          Request.encode(Request.create({ disableStream: {} })).finish()
+        );
+      }
+    } catch {
+      // Abort still completes; the firmware lease bounds a lost stop request.
+    } finally {
+      if (lifetime.active && lifetime === streamLifetimeRef.current) {
+        lifetime.active = false;
+        disconnect();
+      }
+    }
+  }, [disconnect, disconnectPending, rollbackPendingStart]);
 
   if (!zmkApp) return null;
 
@@ -594,13 +850,15 @@ export function InputStreamSection({
           title={streamingEnabled ? "Streaming" : "Stream off"}
         />
         <span className="status-device">{deviceName}</span>
-        <span className="layer-badge">Layer {activeLayer}</span>
+        <span className="layer-badge">
+          Layer {activeLayerKnown ? activeLayer : "?"}
+        </span>
         {isLoading && <span className="status-hint">Loading…</span>}
         {subsystem ? (
           <button
             className={`btn btn-sm ${streamingEnabled ? "btn-danger" : "btn-primary"}`}
             onClick={toggleStreaming}
-            disabled={unlockPending || streamPending}
+            disabled={unlockPending || streamPending || disconnectPending}
           >
             {streamingEnabled ? "Disable Stream" : "Enable Stream"}
           </button>
@@ -614,7 +872,8 @@ export function InputStreamSection({
         )}
         <button
           className="btn btn-sm btn-ghost"
-          onClick={disconnect}
+          onClick={() => void disconnectStream()}
+          disabled={disconnectPending}
           title="Disconnect"
         >
           ×
@@ -665,6 +924,8 @@ export function InputStreamSection({
             layout={layout}
             keymap={keymap}
             activeLayer={activeLayer}
+            activeLayerKnown={activeLayerKnown}
+            activeLayerMask={activeLayerMask}
             behaviorMap={behaviorMap}
             pressedKeys={pressedKeys}
             everPressedKeys={everPressedKeys}
@@ -727,6 +988,8 @@ interface KeyboardLayoutViewProps {
   layout: PhysicalLayouts["layouts"][number];
   keymap: Keymap;
   activeLayer: number;
+  activeLayerKnown: boolean;
+  activeLayerMask: number | null;
   behaviorMap: Map<number, GetBehaviorDetailsResponse>;
   pressedKeys: Set<number>;
   everPressedKeys: Set<number>;
@@ -736,6 +999,8 @@ function KeyboardLayoutView({
   layout,
   keymap,
   activeLayer,
+  activeLayerKnown,
+  activeLayerMask,
   behaviorMap,
   pressedKeys,
   everPressedKeys,
@@ -755,12 +1020,15 @@ function KeyboardLayoutView({
       }}
     >
       {layout.keys.map((key, i) => {
-        const binding = getEffectiveBinding(
-          keymap,
-          i,
-          activeLayer,
-          behaviorMap
-        );
+        const binding = activeLayerKnown
+          ? getEffectiveBinding(
+              keymap,
+              i,
+              activeLayer,
+              behaviorMap,
+              activeLayerMask
+            )
+          : null;
         const label = binding ? getKpLabel(binding, behaviorMap) : "";
         return (
           <KeyCap
